@@ -1,0 +1,372 @@
+# BUILD BRIEF: [APP NAME] — No-Code Data Sync Platform (MVP v1)
+
+You are a senior full-stack engineer. Build a production-ready MVP, not a mockup. Every screen must be backed by real data, real auth, real jobs, and real API calls. Work in the order given in Section 14, commit in small steps, and do not skip the acceptance criteria in Section 16.
+
+## 0. ASSUMPTIONS (state these in the README, and follow them)
+- App name is a placeholder. Read it from env var `NEXT_PUBLIC_APP_NAME` (default "SyncApp") so it can be renamed without code changes.
+- Solo founder, small budget, so managed services everywhere and no self-hosted infrastructure.
+- Initial ICP: freelancers and small agencies that run client work in Notion/Airtable and need leads or contacts synced with HubSpot or Google Sheets.
+- Sync is record-level and eventually consistent. We do NOT promise sub-second latency. "Real-time" means webhook-triggered, usually within 1 minute.
+- Each connector exposes "objects" (a Sheet tab, a Notion database, an Airtable table, a HubSpot object type, a CSV dataset). Each object has "fields" and "records".
+- Currency is USD. English-only UI. Desktop-first, responsive down to tablet.
+- Third-party API quirks (rate limits, scopes) must be verified against each vendor's current docs while building. Do not guess scopes or endpoints from memory.
+
+## 1. PRODUCT SUMMARY
+A web app where non-technical users connect two data sources, visually map fields, choose a sync direction, dry-run it, and activate it, all in under 10 minutes. The app then keeps records synchronized automatically, with a dashboard showing health, history, and errors.
+
+Wedge: instead of "everything", we are the best, simplest way to keep Notion, Airtable, Google Sheets, HubSpot, and CSV data in sync, with trustworthy conflict handling and clear, human-readable errors.
+
+## 2. V1 SCOPE
+
+### In scope
+1. Auth: email/password plus Google sign-in, email verification, password reset.
+2. Workspaces (teams) with roles: Owner, Admin, Member, Viewer.
+3. Connectors: Google Sheets, Notion, Airtable, HubSpot (Contacts, Companies, Deals), CSV upload/import (a one-time or re-uploadable dataset that acts as a source or destination).
+4. Connected accounts via OAuth (Airtable/Notion/HubSpot/Google). Tokens encrypted at rest.
+5. Visual sync builder wizard (Section 7).
+6. Sync directions: one-way (A→B), one-way (B→A), two-way.
+7. Sync triggers: manual, scheduled (interval), and webhook/real-time where the connector supports it, with polling fallback.
+8. Operations: create, update, delete (hard delete OFF by default; soft-delete/archive or "ignore deletes" options).
+9. Conflict rules for two-way: source-wins, destination-wins, newest-update-wins, manual review (review queue UI).
+10. Field mapping with type detection, suggested mappings, required-field warnings, transformations.
+11. Filters (per sync) on source records.
+12. Dry-run/simulation before activation and on demand.
+13. Sync dashboard, per-sync history, event log, error center with fix guidance, retries, dead-letter queue, manual replay.
+14. Stripe billing: plans, 14-day trial, upgrade prompts, plan-limit enforcement, customer portal.
+15. API keys (workspace-scoped) with a minimal REST API: list syncs, trigger a sync run, get run status.
+16. Audit log, workspace data export, workspace deletion, connection deletion with data purge.
+17. Marketing landing page + pricing page + docs stubs.
+
+### OUT of scope for V1 (do NOT build)
+- Salesforce, Shopify, Stripe-as-a-source, Jira, Trello, Postgres, or any connector beyond the five above. Only design the abstraction so they can be added later.
+- Multi-hop pipelines (A→B→C), joins across sources, many-to-one merges, or aggregation.
+- Code-based transformations, custom scripts, or formulas beyond the fixed transformation list.
+- Attachment/file/image sync (skip file fields with a clear "unsupported" notice), Notion page body/blocks content (properties only), Airtable linked-record syncing beyond mapping to text (display names).
+- On-prem agents, SSO/SAML, SOC2 tooling, white-labeling, mobile apps, AI features, a public marketplace, or a visual workflow canvas.
+- Real-time collaboration or live cursors.
+- Custom domains per workspace.
+Where something is out of scope, show a clear "Not supported yet" message and never fail silently.
+
+## 3. TECH STACK (use exactly this; do not substitute without a written reason)
+- Framework: Next.js (App Router) + TypeScript (strict mode), deployed to Vercel.
+- UI: Tailwind CSS + shadcn/ui + lucide-react icons. React Hook Form + Zod for forms and validation. TanStack Query for client data fetching.
+- Database/Auth: Supabase (Postgres + Row Level Security + Supabase Auth). Use Drizzle ORM for typed schema and migrations.
+- Background jobs: Inngest (or Trigger.dev if Inngest is unavailable) for durable queues, scheduled jobs, retries, concurrency limits, and step functions. The sync engine must be runnable as a job function so the same code can later move to a worker service.
+- Billing: Stripe (Checkout, Customer Portal, webhooks).
+- Email: Resend (transactional: verification, invites, failure alerts).
+- Observability: Sentry for errors, structured JSON logs, and a `/api/health` endpoint.
+- Encryption: AES-256-GCM envelope encryption using a `ENCRYPTION_KEY` env secret (support key versioning for rotation). Never log tokens.
+- Testing: Vitest for unit tests, Playwright for 2–3 critical E2E flows, MSW or fixtures for mocking vendor APIs.
+
+Why this stack (put a short version in the README): one language end-to-end, managed Postgres with RLS for tenant isolation, durable job infrastructure without running our own workers, fast to ship for a solo founder, easy to scale later.
+
+## 4. ARCHITECTURE
+
+### 4.1 Layers
+1. Web/UI layer (Next.js).
+2. API layer (Next.js route handlers/server actions), validating every input with Zod and checking workspace membership and role on every request.
+3. Sync engine (pure TypeScript package in `/src/lib/sync-engine`), with no framework dependencies and heavily unit-tested.
+4. Connector layer (`/src/lib/connectors/*`), one folder per connector implementing a shared interface.
+5. Jobs layer (Inngest functions) that orchestrate engine runs.
+6. Data layer (Drizzle schema + RLS policies).
+
+### 4.2 Connector interface (TypeScript; every connector MUST implement it)
+```
+interface Connector {
+  id: string;                       // "google_sheets" | "notion" | "airtable" | "hubspot" | "csv"
+  displayName: string;
+  capabilities: {
+    read: boolean; write: boolean; delete: boolean;
+    webhooks: boolean; incrementalSync: boolean; schemaDiscovery: boolean;
+  };
+  auth: {
+    type: "oauth2" | "none";
+    getAuthUrl(ctx): string;
+    exchangeCode(ctx, code): Promise<TokenSet>;
+    refresh(ctx, tokens): Promise<TokenSet>;
+    requiredScopes: string[];       // least-privilege
+  };
+  listObjects(account): Promise<ObjectRef[]>;                 // sheets, databases, tables, object types
+  getSchema(account, object): Promise<UniversalSchema>;       // fields + types + required flags
+  readRecords(account, object, opts: {
+    cursor?: string; since?: Date; filter?: Filter; pageSize: number;
+  }): Promise<{ records: UniversalRecord[]; nextCursor?: string }>;
+  createRecord(account, object, rec, idempotencyKey): Promise<WriteResult>;
+  updateRecord(account, object, externalId, rec, idempotencyKey): Promise<WriteResult>;
+  deleteRecord?(account, object, externalId, idempotencyKey): Promise<WriteResult>;
+  registerWebhook?(account, object, callbackUrl): Promise<WebhookRegistration>;
+  verifyWebhook?(req): Promise<WebhookEvent[]>;
+  rateLimitPolicy: { requestsPerSecond: number; burst: number; respectRetryAfter: true };
+  mapError(err: unknown): NormalizedError;                    // vendor error → our error taxonomy
+}
+```
+Adding a new connector must require ONLY a new folder implementing this interface plus one registry entry. Document this in `/docs/ADDING_A_CONNECTOR.md`.
+
+### 4.3 Universal internal data model
+```
+UniversalSchema { objectId, fields: UniversalField[] }
+UniversalField { key, label, type, required, readOnly, options?, vendorType }
+type = text | longtext | number | currency | boolean | date | datetime | email | phone | url | select | multiselect | user | json | unsupported
+
+UniversalRecord {
+  externalId: string,              // id in the vendor system
+  values: Record<fieldKey, unknown>,
+  updatedAt?: ISO string,          // vendor's last-modified timestamp when available
+  deleted?: boolean,
+  hash: string                     // stable hash of normalized values
+}
+```
+Every connector normalizes vendor data into these types on read and denormalizes on write.
+
+### 4.4 Sync engine algorithm (implement and document)
+1. Load sync config, mappings, filters, and current state (including a `record_links` table mapping source externalId ↔ destination externalId).
+2. Read changed records from each side: incremental by cursor/timestamp when supported, otherwise full read with hash comparison.
+3. Apply filters. Normalize and transform per field mapping.
+4. For each record, compute the action: create / update / delete / skip / conflict, by comparing against the last-synced hash stored in `record_links`.
+5. For two-way syncs, a conflict exists when BOTH sides changed since the last successful sync. Resolve with the configured rule; manual review writes a `conflicts` row and pauses only that record.
+6. Loop prevention: store the hash of the values we wrote; when reading back, ignore changes that match our own last write.
+7. Write in batches within each connector's limits, using idempotency keys of the form `{syncId}:{runId}:{recordLinkId}:{action}` stored in `sync_events`, so a retried job never double-creates.
+8. Record every outcome as a `sync_event`. Update run counters and `record_links`.
+9. Respect plan limits (record count, frequency) before and during the run.
+
+### 4.5 Reliability
+- Per-connector rate limiting via token bucket; honor `Retry-After` headers; exponential backoff with jitter (e.g., 1s, 2s, 4s… capped at 5 min, max 6 attempts).
+- Classify errors: `retryable` (429, 5xx, network), `auth` (expired/revoked token → mark connected account "needs reconnect", pause syncs, email owner), `mapping` (bad field/type/required missing), `permission`, `validation`, `unsupported`, `unknown`.
+- Circuit breaker per connected account: after N consecutive failures, open the circuit for a cooldown period and mark syncs "paused (provider issue)".
+- Dead-letter queue: records/events that exhaust retries go to `dead_letters` with payload, error, and attempt history. UI offers "Replay" (single or bulk) and "Dismiss".
+- Webhook handlers must verify signatures where the vendor supports it, respond fast (<2s), enqueue work, and dedupe by event id.
+- Concurrency: only one run per sync at a time (lock); skip or queue duplicate triggers.
+- Token refresh handled centrally with a lock to avoid refresh races.
+
+## 5. DATABASE SCHEMA (Drizzle + Postgres, all tables have `id uuid pk`, `created_at`, `updated_at`)
+Create migrations and RLS policies for all tenant-owned tables (access only if the user is a member of the row's `workspace_id`; role checks for writes).
+
+- `users` (mirror of Supabase auth user: email, name, avatar_url)
+- `workspaces` (name, slug, owner_id, plan_id, trial_ends_at, deleted_at)
+- `workspace_members` (workspace_id, user_id, role enum: owner|admin|member|viewer, invited_by)
+- `workspace_invites` (workspace_id, email, role, token_hash, expires_at, accepted_at)
+- `connectors` (static registry mirror: key, display_name, is_premium, capabilities jsonb)
+- `connected_accounts` (workspace_id, connector_key, display_name, external_account_id, encrypted_access_token, encrypted_refresh_token, key_version, scopes[], expires_at, status enum: active|needs_reconnect|revoked, created_by)
+- `sources` / `destinations`: implement as a single `data_endpoints` table (workspace_id, connected_account_id nullable for CSV, object_ref jsonb, schema_snapshot jsonb, schema_fetched_at, role enum: source|destination|both). Expose "sources" and "destinations" in the UI only.
+- `csv_datasets` (workspace_id, name, file_path, row_count, columns jsonb, uploaded_by)
+- `sync_configs` (workspace_id, name, endpoint_a_id, endpoint_b_id, direction enum: a_to_b|b_to_a|two_way, conflict_rule enum: source_wins|destination_wins|newest_wins|manual, trigger_mode enum: manual|scheduled|webhook, interval_minutes, delete_behavior enum: ignore|soft_delete|hard_delete, filters jsonb, status enum: draft|active|paused|error, last_run_at, next_run_at, created_by)
+- `field_mappings` (sync_config_id, source_field_key, destination_field_key, transform jsonb, default_value, is_key boolean, required boolean)
+- `record_links` (sync_config_id, a_external_id, b_external_id, last_synced_hash_a, last_synced_hash_b, last_synced_at, a_deleted, b_deleted)
+- `sync_runs` (sync_config_id, trigger enum: manual|schedule|webhook|api|dry_run, status enum: queued|running|succeeded|partial|failed|cancelled, started_at, finished_at, records_read, created, updated, deleted, skipped, conflicts, failed, is_dry_run)
+- `sync_events` (sync_run_id, record_link_id nullable, action, side, status, idempotency_key unique, before jsonb, after jsonb, message)
+- `sync_errors` (sync_run_id, sync_event_id nullable, category, code, user_message, fix_hint, raw jsonb (redacted), is_resolved)
+- `retries` (sync_event_id, attempt, scheduled_at, executed_at, outcome, error)
+- `dead_letters` (sync_config_id, sync_event_id, payload jsonb, last_error, status enum: open|replayed|dismissed)
+- `conflicts` (sync_config_id, record_link_id, a_value jsonb, b_value jsonb, status enum: open|resolved, resolution enum: use_a|use_b|custom, resolved_by, resolved_at)
+- `webhook_registrations` (data_endpoint_id, vendor_webhook_id, secret_encrypted, status)
+- `plans` (key: free|starter|pro|business, name, price_monthly_cents, stripe_price_id, limits jsonb: {max_records, max_active_syncs, min_interval_minutes, premium_connectors, team_seats, log_retention_days, realtime})
+- `subscriptions` (workspace_id, stripe_customer_id, stripe_subscription_id, plan_key, status, trial_end, current_period_end, cancel_at_period_end)
+- `usage_counters` (workspace_id, period_start, period_end, records_synced, runs_count, active_syncs_peak)
+- `api_keys` (workspace_id, name, key_prefix, key_hash, last_used_at, revoked_at, created_by)
+- `audit_logs` (workspace_id, actor_user_id, action, target_type, target_id, metadata jsonb, ip, user_agent)
+
+Add indexes on: foreign keys, `(sync_config_id, started_at desc)` for runs, `idempotency_key`, `(workspace_id, created_at)` for audit logs. Include a seed script with demo plans and a demo workspace using fixture data (no real credentials).
+
+## 6. PLANS, LIMITS, AND PRICING
+Free trial: 14 days of the Pro plan for every new workspace, no credit card required. After the trial, the workspace drops to Free unless subscribed.
+
+| Plan | Price | Records synced (total linked) | Active syncs | Fastest schedule | Seats | Log retention | Connectors |
+|---|---|---|---|---|---|---|---|
+| Free | $0 | 500 | 2 | every 60 min | 1 | 7 days | CSV, Google Sheets, Airtable, Notion |
+| Starter | $19/mo | 5,000 | 5 | every 15 min | 2 | 30 days | Free + HubSpot |
+| Pro | $49/mo | 25,000 | 20 | every 5 min + webhooks | 5 | 90 days | all |
+| Business | $129/mo | 100,000 | 75 | every 1 min + webhooks | 15 | 180 days | all + priority support |
+
+Annual billing = 2 months free (implement as separate Stripe prices). Make all limits data-driven from the `plans` table so they can be edited without code changes.
+
+Enforcement rules:
+- Block activation of a sync that would exceed active-sync or connector limits, with an inline upgrade prompt.
+- If record limit is reached mid-run, stop creating new records, finish updates, mark the run `partial`, and show an "Upgrade to sync the remaining N records" banner. Never delete data because of limits.
+- Show usage meters (records, syncs, seats) in the sidebar and billing page; show a warning at 80% and a blocking prompt at 100%.
+- Trial banner with days remaining; email at day 10 and day 13.
+- Stripe: Checkout for upgrades, Customer Portal for management, webhook handler for `checkout.session.completed`, `customer.subscription.updated|deleted`, `invoice.payment_failed`. Webhooks must be idempotent and signature-verified. Payment failure → 7-day grace period with a banner, then downgrade to Free.
+
+## 7. UI / UX REQUIREMENTS
+Design: clean, modern, minimal SaaS. Neutral palette with one accent color, generous whitespace, 8px spacing grid, inter-style sans font, light and dark mode, accessible contrast (WCAG AA), keyboard navigable, with empty, loading, and error states on every screen.
+
+### 7.1 Navigation
+Sidebar: Dashboard, Syncs, Connections, Review Queue (badge count), Activity/Logs, Settings. Top bar: workspace switcher, user menu, upgrade button when applicable.
+
+### 7.2 Onboarding wizard ("New Sync", also shown on first login)
+Steps with a progress bar, autosaved as draft so users can leave and resume:
+1. Connect source (choose connector → OAuth or CSV upload; reuse existing connections).
+2. Connect destination.
+3. Select data (pick object/table/sheet/database for each side; show a 5-row live preview).
+4. Map fields (see 7.3).
+5. Choose direction, conflict rule, trigger (manual/schedule/webhook), delete behavior, and filters (simple builder: field + operator + value, AND/OR groups, max 5 conditions).
+6. Test: run a dry-run (see 7.4) and show a summary: would create X, update Y, skip Z, conflicts N, warnings.
+7. Activate: confirm plan limits, then go live with an optional "run first sync now".
+Goal: a user with two accounts ready can finish in under 10 minutes. Add inline help text for every step.
+
+### 7.3 Field-mapping screen
+- Two-column layout (source fields left, destination fields right) with drag-to-connect or dropdown selection.
+- Auto-suggest mappings via name similarity (normalized, case-insensitive, synonyms like "e-mail"/"email", "tel"/"phone") plus type compatibility; show a confidence badge and a one-click "Accept all suggestions".
+- Auto-detect and display field types with icons; warn on lossy or incompatible conversions (e.g., text→number) and offer a transformation.
+- Required destination fields without a mapping are flagged in red and block progress unless a default value is set.
+- Choose exactly one "unique key" field pair used for matching records across systems (suggest email/ID/name); warn if the key is not unique in a sample.
+- Per-field transformations (fixed list only): date format conversion, text→number, number→currency formatting, lowercase, uppercase, trim whitespace, split full name (first/last), combine fields (concatenate with separator), default value if empty, map select values (value mapping table).
+- Live preview of the first 5 records after transformations.
+
+### 7.4 Dry-run / simulation mode
+Executes the full engine with writes disabled. Produces a downloadable report (CSV) and an on-screen table of planned actions with before/after diffs, conflicts, warnings (e.g., "42 records missing required field Email"), and the predicted record count against plan limits. No data is written to external systems and no usage is counted. Dry-run is required once before first activation (can be skipped only with an explicit confirmation checkbox).
+
+### 7.5 Dashboard
+Cards: active syncs, syncs with errors, records processed (7 days), failure rate. Table of syncs: name, connectors (icons), direction, status, last run, next run, records processed, errors, actions (run now, pause/resume, edit, duplicate, delete). Filters and search. Trend chart of runs/records over time.
+
+### 7.6 Sync detail page
+Tabs: Overview, Mapping, Runs, Events/Logs, Conflicts, Settings. Runs table with status, duration, counts, trigger. Run detail view with per-record events, filterable by status/action, with before/after diff and a "replay failed" button.
+
+### 7.7 Sync Health / Error Center
+List of errors grouped by cause with plain-English explanations and a "Fix this" action that deep-links to the exact mapping or connection setting. Examples of required messages:
+- "Your Airtable field 'Status' only accepts: Todo, Doing, Done. We received 'In progress' on 12 records. → Add a value mapping."
+- "HubSpot needs 'Email' to be set for Contacts. 8 records have it empty. → Set a default value or filter them out."
+- "Your Notion connection expired. → Reconnect Notion."
+- "Google Sheets is rate-limiting us. We'll retry automatically in 2 minutes."
+Include a dead-letter tab with replay/dismiss and bulk replay.
+
+### 7.8 Review Queue (manual conflict resolution)
+For records in conflict show both versions side by side with changed fields highlighted; actions: keep A, keep B, pick per field, apply to all similar. Resolved decisions are written in the next sync and logged in the audit log.
+
+### 7.9 Connections page
+List connected accounts with status, scopes, who connected it, and which syncs use it. Actions: reconnect, rename, disconnect (warn which syncs will pause; offer "disconnect and delete cached data").
+
+### 7.10 Settings
+- General (workspace name, slug, timezone), Team (invite/remove, change roles, pending invites), Billing (plan, usage, upgrade, invoices via Customer Portal), API Keys (create shows the key ONCE, stores only a hash; revoke), Notifications (email on failure/needs-reconnect/conflicts digest), Security (audit log viewer with filters), Data & Privacy (export workspace as ZIP of JSON/CSV; delete workspace with typed confirmation and 7-day soft-delete grace; delete a connection's data).
+
+### 7.11 Marketing pages
+Landing page (headline, 3 benefits, how-it-works in 3 steps, supported integrations grid, pricing table, FAQ, CTA), pricing page, privacy policy and terms placeholders, and a changelog stub.
+
+## 8. SECURITY REQUIREMENTS
+- OAuth wherever the vendor supports it; never store raw third-party passwords. Use PKCE/state parameters and validate redirect URIs.
+- Encrypt all tokens/webhook secrets at rest with AES-256-GCM, key versioning supported; decrypt only inside server code; never send tokens to the client or logs.
+- Request least-privilege scopes per connector (read-only scopes when a connection is only used as a source, expanding via re-consent when write is needed). List scopes in `/docs/SCOPES.md` with the reason for each.
+- Row Level Security on all tenant tables, plus server-side role checks. Add tests proving workspace A cannot read workspace B data.
+- Validate all inputs with Zod, parameterize all queries, escape output, set CSP/security headers, CSRF protection for state-changing routes, and rate-limit auth, API, and webhook endpoints.
+- API keys: hashed storage (SHA-256 with prefix lookup), scoped to one workspace, rate limited.
+- Redact PII and secrets from logs and error payloads. Store only the record data needed for diffs, and purge event payloads per plan retention.
+- Audit-log security-relevant actions: login, invite, role change, connection added/removed, sync created/activated/deleted, API key created/revoked, export, deletion, billing changes.
+- CSV uploads: size limit (10 MB / 50k rows in V1), MIME and extension checks, parse safely, protect against formula injection (prefix cells starting with `=`, `+`, `-`, `@` when exporting).
+
+## 9. DATA DELETION AND EXPORT
+- Workspace export: background job producing a ZIP (configs, mappings, runs summary, audit log, record links) emailed as a time-limited signed link.
+- Workspace deletion: owner-only, typed confirmation, 7-day soft delete, then permanent purge job (including tokens, cached payloads, files).
+- Connection deletion: revokes the token at the vendor where supported, deletes encrypted credentials, pauses dependent syncs.
+- Never delete records in connected third-party systems unless the user explicitly selected `hard_delete` behavior (default `ignore`, with a confirmation warning).
+
+## 10. REST API (minimal, V1)
+`Authorization: Bearer <api_key>`, JSON, versioned under `/api/v1`:
+- `GET /syncs`, `GET /syncs/:id`
+- `POST /syncs/:id/run` (returns run id; respects locks and plan limits)
+- `GET /runs/:id`
+Return consistent error shapes `{ error: { code, message } }`. Document in `/docs/API.md`.
+
+## 11. NOTIFICATIONS
+Emails (Resend) for: verify email, invite, sync failed (rate-limited to avoid spam), connection needs reconnect, conflicts waiting, trial ending, payment failed, export ready. In-app toasts and a notification bell are a nice-to-have, not required.
+
+## 12. NON-FUNCTIONAL REQUIREMENTS
+- Performance: dashboard loads in <2s on 100 syncs; a sync of 5,000 records completes in <5 min under normal vendor rate limits; large reads are paginated and processed in chunks (no loading everything into memory).
+- Reliability: every job is idempotent and resumable from its cursor; a crashed run can be resumed or marked failed without duplicates.
+- Observability: each run has a correlation id included in all logs; Sentry captures job and API errors.
+- Accessibility: keyboard navigation, labels, focus states, and reduced-motion respect.
+- Code quality: strict TypeScript, ESLint + Prettier, no `any` in the engine and connectors, and meaningful unit tests for the engine (conflict rules, loop prevention, idempotency, transformations, filters).
+
+## 13. ENVIRONMENT AND CONFIG
+Provide `.env.example` with placeholders for: Supabase URL/keys, database URL, `ENCRYPTION_KEY`, Stripe keys + webhook secret + price ids, Resend key, Inngest keys, Sentry DSN, and client IDs/secrets for Google, Notion, Airtable, HubSpot. Provide a README with setup steps, OAuth app registration instructions for each vendor (redirect URIs), Stripe test-mode setup, and how to run locally with `npm run dev` plus the Inngest dev server. Use a mock connector (in-memory) so the whole app can be demoed without real vendor credentials.
+
+## 14. BUILD ORDER (2-week plan; do not start a step before the previous one works end to end)
+Week 1
+- Day 1: Project scaffold, Supabase, Drizzle schema, RLS, auth, workspace creation, roles, layout shell.
+- Day 2: Connector interface, registry, mock connector, CSV connector, universal types.
+- Day 3: Sync engine core (diffing, record links, one-way create/update), with unit tests.
+- Day 4: Google Sheets and Airtable connectors (OAuth, schema discovery, read/write, rate limiting).
+- Day 5: Jobs layer (manual + scheduled runs), run/event logging, retries, backoff.
+- Day 6–7: New Sync wizard, field mapping UI, transformations, filters, dry-run.
+Week 2
+- Day 8: Notion and HubSpot connectors.
+- Day 9: Two-way sync, conflict rules, review queue, loop prevention, delete behavior.
+- Day 10: Webhooks (where supported), circuit breaker, dead-letter queue, replay.
+- Day 11: Dashboard, sync detail pages, error center with fix guidance.
+- Day 12: Stripe billing, trial logic, plan limits, usage meters, upgrade prompts.
+- Day 13: API keys + API, audit log, export/deletion, notification emails, settings pages.
+- Day 14: Landing/pricing pages, E2E tests, security pass, README, deploy to Vercel, smoke test with real accounts.
+If time runs short, cut in this order: HubSpot webhooks → Notion write support → API keys → notification emails. Never cut: encryption, RLS, idempotency, dry-run, plan limits.
+
+## 15. EXPLICITLY DO NOT
+- Do not add connectors beyond the five listed, or build "coming soon" fake integrations that appear to work.
+- Do not use mock data in production screens; mock data only in the mock connector and tests.
+- Do not store tokens or secrets in plaintext, localStorage, or logs.
+- Do not hard-delete external records by default.
+- Do not build features listed under "OUT of scope".
+- Do not over-engineer (no microservices, Kubernetes, GraphQL, or custom auth).
+- Do not leave TODO placeholders in shipped flows; if something is not supported, show a clear message in the UI.
+
+## 16. ACCEPTANCE CRITERIA / DEFINITION OF DONE
+The MVP is done only when ALL of the following are verified (write Playwright/Vitest tests where practical and a manual QA checklist in `/docs/QA.md`):
+1. A new user can sign up, verify email, create a workspace, and land in the onboarding wizard.
+2. A user can connect Google Sheets and Airtable via OAuth, map fields with auto-suggestions, run a dry-run, activate, and see records appear in the destination, all within 10 minutes.
+3. Notion and HubSpot each work as both source and destination for at least one object type (Notion database; HubSpot Contacts).
+4. CSV upload works as a source and as a destination (export), with type detection.
+5. Two-way sync works for at least Sheets ↔ Airtable, and all four conflict rules behave as specified (tests prove each). Manual review items appear in the Review Queue and resolve correctly.
+6. No infinite sync loops: after a two-way sync stabilizes, a subsequent run produces zero writes (test).
+7. Re-running the same job or retrying after a simulated crash creates no duplicate records (idempotency test).
+8. Rate-limit (429) and 5xx responses trigger backoff and eventual success; permanent failures land in the dead-letter queue and can be replayed from the UI.
+9. Expired/revoked OAuth tokens mark the connection "needs reconnect", pause dependent syncs, and notify the owner.
+10. Error center shows human-readable messages with working "Fix this" deep links for at least: missing required field, invalid select option, expired token, and rate limiting.
+11. Stripe test-mode flow works: trial → upgrade via Checkout → plan limits change → Customer Portal → cancel → downgrade. Plan limits are enforced with upgrade prompts at the specified thresholds.
+12. Tenant isolation test passes: a user in workspace A cannot read or modify workspace B resources through the UI, API, or direct DB queries under RLS.
+13. All tokens are encrypted in the database (verified by inspecting rows); no secrets appear in logs or client bundles.
+14. Audit log records the listed security events and is viewable by Owner/Admin.
+15. Workspace export and deletion work end to end; connection deletion purges credentials.
+16. API keys can trigger a sync run and read run status.
+17. Lighthouse score ≥ 90 for performance/accessibility/best-practices on the landing page; app passes `npm run lint`, `npm run typecheck`, and `npm test` with zero errors.
+18. Deployed to Vercel with a working production environment, health endpoint, Sentry connected, and a README that lets a new developer run everything locally in <30 minutes.
+
+## 17. FINAL DELIVERABLES
+1. Working deployed app and a Git repo with clear commit history.
+2. `/docs`: ARCHITECTURE.md, ADDING_A_CONNECTOR.md, SCOPES.md, API.md, QA.md, RUNBOOK.md (how to replay dead letters, rotate encryption keys, handle a vendor outage).
+3. A short "Known limitations" section in the README listing everything intentionally excluded from V1.
+
+---
+
+# APPENDIX A — LAUNCH STRATEGY (for the founder; the coding agent should implement only the pricing page and landing copy from this)
+
+**First niche/ICP:** Small agencies and freelancers (1–15 people) running client projects and lead tracking in Notion/Airtable who must keep contacts, deals, and project data in sync with HubSpot and Google Sheets without hiring a developer. Pain: manual copy-paste, stale data, and Zapier bills that scale with task counts.
+
+**Positioning line:** "Keep Notion, Airtable, Google Sheets, and HubSpot in sync — set up in 10 minutes, no code, no surprise task bills."
+
+**Free plan:** 500 linked records, 2 active syncs, hourly schedule, 7-day logs. **Paid:** Starter $19, Pro $49, Business $129 (annual = 2 months free). 14-day Pro trial, no card.
+
+**First 10 marketing/search keywords:**
+1. notion airtable sync
+2. sync google sheets with hubspot
+3. airtable to notion two way sync
+4. notion to google sheets sync automatically
+5. hubspot airtable integration
+6. two way sync google sheets airtable
+7. csv import hubspot sync automatically
+8. alternative to zapier for data sync
+9. keep notion database in sync with hubspot
+10. no code data sync tool
+
+**10 Reddit/X search queries to find early users and complaints:**
+1. "sync notion and airtable" (Reddit: r/Notion, r/Airtable)
+2. "two way sync" airtable google sheets
+3. "notion sync hubspot" frustrated OR "doesn't work"
+4. "zapier too expensive" sync
+5. "duplicate records" zapier OR make airtable
+6. "keep google sheets updated" hubspot contacts
+7. "sync notion database" "two-way"
+8. "airtable sync limits" OR "airtable sync broken"
+9. "need to sync" "hubspot" "airtable" agency
+10. "best way to sync" notion "google sheets"
+
+**30-day launch plan:**
+- Days 1–7 (pre-launch): Landing page + waitlist; post build-in-public updates; DM 20 agency owners/freelancers from the search queries above for 15-minute interviews; set up 3 demo videos (Sheets↔Airtable, Notion↔HubSpot, CSV→Notion).
+- Days 8–14 (private beta): Onboard 10–20 users manually, watch them set up a sync, fix every friction point; collect testimonials; set up in-app feedback.
+- Days 15–21 (public launch): Product Hunt, Indie Hackers, relevant subreddits (follow each community's self-promotion rules; lead with a helpful tutorial, not an ad), Notion/Airtable community forums, and X thread with a demo GIF. Publish two SEO pages from the keyword list ("How to sync Notion and Airtable", "Google Sheets ↔ HubSpot sync").
+- Days 22–30 (iterate and convert): Weekly changelog, email trial users at day 3/10/13, add a connector-request voting page to choose the next integration (likely Salesforce or Shopify based on votes), publish 2 more comparison/tutorial posts, and track activation (first successful sync), trial→paid conversion, and week-4 retention. Target: 100 signups, 30 activated syncs, 5 paying customers by day 30.

@@ -1,0 +1,6 @@
+{
+  "name": "Dataloop",
+  "description": "No-code data sync platform for Notion, Airtable, Google Sheets, HubSpot, and CSV with two-way sync, conflict handling, and field transformations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
